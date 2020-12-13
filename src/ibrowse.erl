@@ -6,7 +6,7 @@
 %%% Created : 11 Oct 2003 by Chandrashekhar Mullaparthi <chandrashekhar.mullaparthi@t-mobile.co.uk>
 %%%-------------------------------------------------------------------
 %% @author Chandrashekhar Mullaparthi <chandrashekhar dot mullaparthi at gmail dot com>
-%% @copyright 2005-2012 Chandrashekhar Mullaparthi
+%% @copyright 2005-2014 Chandrashekhar Mullaparthi
 %% @doc The ibrowse application implements an HTTP 1.1 client in erlang. This
 %% module implements the API of the HTTP client. There is one named
 %% process called 'ibrowse' which assists in load balancing and maintaining configuration. There is one load balancing process per unique webserver. There is
@@ -90,6 +90,7 @@
          stream_close/1,
          set_max_sessions/3,
          set_max_pipeline_size/3,
+         set_max_attempts/3,
          set_dest/3,
          trace_on/0,
          trace_off/0,
@@ -110,7 +111,8 @@
 -import(ibrowse_lib, [
                       parse_url/1,
                       get_value/3,
-                      do_trace/2
+                      do_trace/2,
+                      log_msg/2
                      ]).
                       
 -record(state, {trace = false}).
@@ -120,6 +122,7 @@
 
 -define(DEF_MAX_SESSIONS,10).
 -define(DEF_MAX_PIPELINE_SIZE,10).
+-define(DEF_MAX_ATTEMPTS,3).
 
 %%====================================================================
 %% External functions
@@ -150,7 +153,7 @@ stop() ->
 %% The Status return value indicates the HTTP status code returned by the webserver
 %% @spec send_req(Url::string(), Headers::headerList(), Method::method()) -> response()
 %% headerList() = [{header(), value()}]
-%% header() = atom() | string()
+%% header() = atom() | string() | binary()
 %% value() = term()
 %% method() = get | post | head | options | put | delete | trace | mkcol | propfind | proppatch | lock | unlock | move | copy
 %% Status = string()
@@ -175,9 +178,11 @@ send_req(Url, Headers, Method) ->
 send_req(Url, Headers, Method, Body) ->
     send_req(Url, Headers, Method, Body, []).
 
-%% @doc Same as send_req/4. 
-%% For a description of SSL Options, look in the <a href="http://www.erlang.org/doc/apps/ssl/index.html">ssl</a> manpage. If the
-%% HTTP Version to use is not specified, the default is 1.1.
+%% @doc Same as send_req/4.
+
+%% For a description of SSL Options, look in the <a href="http://www.erlang.org/doc/apps/ssl/index.html">ssl</a> manpage.
+%% For a description of Process Options, look in the <a href="http://www.erlang.org/doc/man/gen_server.html">gen_server</a> manpage.
+%% If the HTTP Version to use is not specified, the default is 1.1.
 %% <br/>
 %% <ul>
 %% <li>The <code>host_header</code> option is useful in the case where ibrowse is
@@ -250,9 +255,16 @@ send_req(Url, Headers, Method, Body) ->
 %% headers. Not quite sure why someone would want this, but one of my
 %% users asked for it, so here it is. </li>
 %%
+%% <li> The <code>preserve_status_line</code> option is to get the raw status line as a custom header
+%% in the response. The status line is returned as a tuple {ibrowse_status_line, Status_line_binary}
+%% If both the <code>give_raw_headers</code> and <code>preserve_status_line</code> are specified 
+%% in a request, only the <code>give_raw_headers</code> is honoured. </li>
+%% 
 %% <li> The <code>preserve_chunked_encoding</code> option enables the caller
 %% to receive the raw data stream when the Transfer-Encoding of the server
 %% response is Chunked.
+%% </li>
+%% <li> The <code>return_raw_request</code> option enables the caller to get the exact request which was sent by ibrowse to the server, along with the response. When this option is used, the response for synchronous requests is a 5-tuple instead of the usual 4-tuple. For asynchronous requests, the calling process gets a message <code>{ibrowse_async_raw_req, Raw_req}</code>. 
 %% </li>
 %% </ul>
 %%
@@ -260,6 +272,7 @@ send_req(Url, Headers, Method, Body) ->
 %% optionList() = [option()]
 %% option() = {max_sessions, integer()}        |
 %%          {response_format,response_format()}|
+%%          {stream_full_chunks, boolean()}    |
 %%          {stream_chunk_size, integer()}     |
 %%          {max_pipeline_size, integer()}     |
 %%          {trace, boolean()}                 | 
@@ -286,8 +299,26 @@ send_req(Url, Headers, Method, Body) ->
 %%          {headers_as_is, boolean()}         |
 %%          {give_raw_headers, boolean()}      |
 %%          {preserve_chunked_encoding,boolean()}     |
-%%          {workaround, head_response_with_body}
+%%          {workaround, head_response_with_body}     |
+%%          {worker_process_options, list()} |
+%%          {return_raw_request, true}         |
+%%          {max_attempts, integer()}          |
+%%          {socks5_host, host()}              |
+%%          {socks5_port, integer()}           |
+%%          {socks5_user, binary()}            |
+%%          {socks5_password, binary()}
 %%
+%% ip4_address() = {0..255, 0..255, 0..255, 0..255}
+%% ip6_address() = 
+%%     {0..65535,
+%%      0..65535,
+%%      0..65535,
+%%      0..65535,
+%%      0..65535,
+%%      0..65535,
+%%      0..65535,
+%%      0..65535}
+%% host() = string() | ip4_address() | ip6_address()
 %% stream_to() = process() | {process(), once}
 %% process() = pid() | atom()
 %% username() = string()
@@ -319,6 +350,7 @@ send_req(Url, Headers, Method, Body, Options, Timeout) ->
                      end,
             Max_sessions = get_max_sessions(Host, Port, Options),
             Max_pipeline_size = get_max_pipeline_size(Host, Port, Options),
+            Max_attempts = get_max_attempts(Host, Port, Options),
             Options_1 = merge_options(Host, Port, Options),
             {SSLOptions, IsSSL} =
                 case (Protocol == https) orelse
@@ -330,7 +362,7 @@ send_req(Url, Headers, Method, Body, Options, Timeout) ->
                                 Max_sessions, 
                                 Max_pipeline_size,
                                 {SSLOptions, IsSSL}, 
-                                Headers, Method, Body, Options_1, Timeout, 0);
+                                Headers, Method, Body, Options_1, Timeout, Timeout, os:timestamp(), Max_attempts, 0);
         Err ->
             {error, {url_parsing_failed, Err}}
     end.
@@ -339,27 +371,41 @@ try_routing_request(Lb_pid, Parsed_url,
                     Max_sessions, 
                     Max_pipeline_size,
                     {SSLOptions, IsSSL}, 
-                    Headers, Method, Body, Options_1, Timeout, Try_count) when Try_count < 3 ->
+                    Headers, Method, Body, Options_1, Timeout,
+                    Ori_timeout, Req_start_time, Max_attempts, Try_count) when Try_count < Max_attempts ->
+    ProcessOptions = get_value(worker_process_options, Options_1, []),
     case ibrowse_lb:spawn_connection(Lb_pid, Parsed_url,
                                              Max_sessions, 
                                              Max_pipeline_size,
-                                             {SSLOptions, IsSSL}) of
-        {ok, Conn_Pid} ->
+                                             {SSLOptions, IsSSL},
+                                             ProcessOptions) of
+        {ok, {_Pid_cur_spec_size, _, Conn_Pid}} ->
             case do_send_req(Conn_Pid, Parsed_url, Headers,
                              Method, Body, Options_1, Timeout) of
                 {error, sel_conn_closed} ->
-                    try_routing_request(Lb_pid, Parsed_url,
-                                        Max_sessions, 
-                                        Max_pipeline_size,
-                                        {SSLOptions, IsSSL}, 
-                                        Headers, Method, Body, Options_1, Timeout, Try_count + 1);
+                    Time_now = os:timestamp(),
+                    Time_taken_so_far = trunc(round(timer:now_diff(Time_now, Req_start_time)/1000)),
+                    Time_remaining = Ori_timeout - Time_taken_so_far,
+                    Time_remaining_percent = trunc(round((Time_remaining/Ori_timeout)*100)),
+                    %% io:format("~p -- Time_remaining: ~p (~p%)~n", [self(), Time_remaining, Time_remaining_percent]),
+                    case (Time_remaining > 0) andalso (Time_remaining_percent >= 5) of
+                        true ->
+                            try_routing_request(Lb_pid, Parsed_url,
+                                                Max_sessions, 
+                                                Max_pipeline_size,
+                                                {SSLOptions, IsSSL}, 
+                                                Headers, Method, Body, Options_1,
+                                                Time_remaining, Ori_timeout, Req_start_time, Max_attempts, Try_count + 1);
+                        false ->
+                            {error, retry_later}
+                    end;
                 Res ->
                     Res
             end;
         Err ->
             Err
     end;
-try_routing_request(_, _, _, _, _, _, _, _, _, _, _) ->
+try_routing_request(_, _, _, _, _, _, _, _, _, _, _, _, _, _) ->
     {error, retry_later}.
 
 merge_options(Host, Port, Options) ->
@@ -388,11 +434,19 @@ get_max_pipeline_size(Host, Port, Options) ->
               get_config_value({max_pipeline_size, Host, Port},
                                default_max_pipeline_size())).
 
+get_max_attempts(Host, Port, Options) ->
+    get_value(max_attempts, Options,
+              get_config_value({max_attempts, Host, Port},
+                               default_max_attempts())).
+
 default_max_sessions() ->
     safe_get_env(ibrowse, default_max_sessions, ?DEF_MAX_SESSIONS).
 
 default_max_pipeline_size() ->
     safe_get_env(ibrowse, default_max_pipeline_size, ?DEF_MAX_PIPELINE_SIZE).
+
+default_max_attempts() ->
+    safe_get_env(ibrowse, default_max_attempts, ?DEF_MAX_ATTEMPTS).
 
 safe_get_env(App, Key, Def_val) ->
     case application:get_env(App, Key) of
@@ -428,17 +482,39 @@ set_max_sessions(Host, Port, Max) when is_integer(Max), Max > 0 ->
 set_max_pipeline_size(Host, Port, Max) when is_integer(Max), Max > 0 ->
     gen_server:call(?MODULE, {set_config_value, {max_pipeline_size, Host, Port}, Max}).
 
+%% @doc Set the maximum attempts for each connection to a specific Host:Port.
+%% @spec set_max_attempts(Host::string(), Port::integer(), Max::integer()) -> ok
+set_max_attempts(Host, Port, Max) when is_integer(Max), Max > 0 ->
+    gen_server:call(?MODULE, {set_config_value, {max_attempts, Host, Port}, Max}).
+
 do_send_req(Conn_Pid, Parsed_url, Headers, Method, Body, Options, Timeout) ->
     case catch ibrowse_http_client:send_req(Conn_Pid, Parsed_url,
                                             Headers, Method, ensure_bin(Body),
                                             Options, Timeout) of
         {'EXIT', {timeout, _}} ->
+            P_info = case catch erlang:process_info(Conn_Pid, [messages, message_queue_len, backtrace]) of
+                            [_|_] = Conn_Pid_info_list ->
+                                Conn_Pid_info_list;
+                            _ ->
+                                process_info_not_available
+                        end,
+            log_msg("{ibrowse_http_client, send_req, ~1000.p} gen_server call timeout.~nProcess info: ~p~n",
+                    [[Conn_Pid, Parsed_url, Headers, Method, Body, Options, Timeout], P_info]),
             {error, req_timedout};
-        {'EXIT', {noproc, {gen_server, call, [Conn_Pid, _, _]}}} ->
+        {'EXIT', {normal, _}} = Ex_rsn ->
+            log_msg("{ibrowse_http_client, send_req, ~1000.p} gen_server call got ~1000.p~n",
+                    [[Conn_Pid, Parsed_url, Headers, Method, Body, Options, Timeout], Ex_rsn]),
+            {error, req_timedout};
+        {error, X} when X == connection_closed;
+                        X == {send_failed, {error, enotconn}};
+                        X == {send_failed,{error,einval}};
+                        X == {send_failed,{error,closed}};
+                        X == connection_closing;
+                        ((X == connection_closed_no_retry) andalso ((Method == get) orelse (Method == head))) ->
             {error, sel_conn_closed};
-        {'EXIT', {normal, _}} ->
-            {error, req_timedout};
-        {error, connection_closed} ->
+        {error, connection_closed_no_retry} ->
+            {error, connection_closed};
+        {error, {'EXIT', {noproc, _}}} ->
             {error, sel_conn_closed};
         {'EXIT', Reason} ->
             {error, {'EXIT', Reason}};
@@ -446,6 +522,13 @@ do_send_req(Conn_Pid, Parsed_url, Headers, Method, Body, Options, Timeout) ->
             case get_value(response_format, Options, list) of
                 list ->
                     {ok, St_code, Headers, binary_to_list(Body)};
+                binary ->
+                    Ret
+            end;
+        {ok, St_code, Headers, Body, Req} = Ret when is_binary(Body) ->
+            case get_value(response_format, Options, list) of
+                list ->
+                    {ok, St_code, Headers, binary_to_list(Body), Req};
                 binary ->
                     Ret
             end;
@@ -470,28 +553,32 @@ ensure_bin({Fun, _} = Body) when is_function(Fun) -> Body.
 %% request is sent via any of the send_req_direct/4,5,6,7 functions.<br/>
 %% <b>Note:</b> It is the responsibility of the calling process to control
 %% pipeline size on such connections.
-%%
-%% @spec spawn_worker_process(Url::string()) -> {ok, pid()}
-spawn_worker_process(Url) ->
-    ibrowse_http_client:start(Url).
 
-%% @doc Same as spawn_worker_process/1 but takes as input a Host and Port
-%% instead of a URL.
+%% @spec spawn_worker_process(Url::string() | {Host::string(), Port::integer()}) -> {ok, pid()}
+spawn_worker_process(Args) ->
+    spawn_worker_process(Args, []).
+
+%% @doc Same as spawn_worker_process/1 except with Erlang process options.
 %% @spec spawn_worker_process(Host::string(), Port::integer()) -> {ok, pid()}
-spawn_worker_process(Host, Port) ->
-    ibrowse_http_client:start({Host, Port}).
+spawn_worker_process(Host, Port) when is_list(Host), is_integer(Port) ->
+    %% Convert old API calls to new API format.
+    spawn_worker_process({Host, Port}, []);
+spawn_worker_process(Args, Options) ->
+    ibrowse_http_client:start(Args, Options).
 
 %% @doc Same as spawn_worker_process/1 except the the calling process
 %% is linked to the worker process which is spawned.
-%% @spec spawn_link_worker_process(Url::string()) -> {ok, pid()}
-spawn_link_worker_process(Url) ->
-    ibrowse_http_client:start_link(Url).
+%% @spec spawn_link_worker_process(Url::string() | {Host::string(), Port::integer()}) -> {ok, pid()}
+spawn_link_worker_process(Args) ->
+    spawn_link_worker_process(Args, []).
 
-%% @doc Same as spawn_worker_process/2 except the the calling process
-%% is linked to the worker process which is spawned.
+%% @doc Same as spawn_link_worker_process/1 except with Erlang process options.
 %% @spec spawn_link_worker_process(Host::string(), Port::integer()) -> {ok, pid()}
-spawn_link_worker_process(Host, Port) ->
-    ibrowse_http_client:start_link({Host, Port}).
+spawn_link_worker_process(Host, Port) when is_list(Host), is_integer(Port) ->
+    %% Convert old API calls to new API format.
+    spawn_link_worker_process({Host, Port}, []);
+spawn_link_worker_process(Args, Options) ->
+    ibrowse_http_client:start_link(Args, Options).
 
 %% @doc Terminate a worker process spawned using
 %% spawn_worker_process/2 or spawn_link_worker_process/2. Requests in
@@ -592,19 +679,35 @@ all_trace_off() ->
 %% @doc Shows some internal information about load balancing. Info
 %% about workers spawned using spawn_worker_process/2 or
 %% spawn_link_worker_process/2 is not included.
+-ifdef(ets_ref).
 show_dest_status() ->
-    io:format("~-40.40s | ~-5.5s | ~-20.20s | ~s~n",
-              ["Server:port", "MBox", "Num conns", "LB Pid"]),
-    io:format("~90.90.=s~n", [""]),
+    io:format("~-40.40s | ~-5.5s | ~-10.10s | ~s~n",
+              ["Server:port", "ETS", "Num conns", "LB Pid"]),
+    io:format("~80.80.=s~n", [""]),
     Metrics = get_metrics(),
     lists:foreach(
-      fun({Host, Port, Lb_pid, MQL, Size}) ->
-              io:format("~40.40s | ~-5.5s | ~-20.20s | ~p~n",
+      fun({Host, Port, {Lb_pid, _, Tid, Size, _}}) ->
+              io:format("~40.40s | ~-5.5s | ~-5.5s | ~p~n",
                         [Host ++ ":" ++ integer_to_list(Port),
-                         integer_to_list(MQL),
+                         ref_to_list(Tid),
                          integer_to_list(Size), 
                          Lb_pid])
       end, Metrics).
+-else.
+show_dest_status() ->
+    io:format("~-40.40s | ~-5.5s | ~-10.10s | ~s~n",
+              ["Server:port", "ETS", "Num conns", "LB Pid"]),
+    io:format("~80.80.=s~n", [""]),
+    Metrics = get_metrics(),
+    lists:foreach(
+      fun({Host, Port, {Lb_pid, _, Tid, Size, _}}) ->
+              io:format("~40.40s | ~-5.5s | ~-5.5s | ~p~n",
+                        [Host ++ ":" ++ integer_to_list(Port),
+                         integer_to_list(Tid),
+                         integer_to_list(Size), 
+                         Lb_pid])
+      end, Metrics).
+-endif.
 
 show_dest_status(Url) ->                                          
     #url{host = Host, port = Port} = ibrowse_lib:parse_url(Url),
@@ -616,37 +719,71 @@ show_dest_status(Url) ->
 %% included.
 show_dest_status(Host, Port) ->
     case get_metrics(Host, Port) of
-        {Host, Port, Lb_pid, MsgQueueSize, Size} ->
+        {Lb_pid, MsgQueueSize,
+         Tid, Size,
+         {{First_p_sz,  First_p_sz},
+          {Last_p_sz, Last_p_sz}}} ->
             io:format("Load Balancer Pid     : ~p~n"
-                      "MBox                  : ~p~n"
-                      "Num Connections       : ~p~n",
-                      [Lb_pid, MsgQueueSize, Size]);
-        no_active_processes ->
-            io:format("No processes for destination~n");
-        Err ->
-            io:format("Metrics not available: ~p~n", [Err])
+                      "LB process msg q size : ~p~n"
+                      "LB ETS table id       : ~p~n"
+                      "Num Connections       : ~p~n"
+                      "Smallest pipeline     : ~p~n"
+                      "Largest pipeline      : ~p~n",
+                      [Lb_pid, MsgQueueSize, Tid, Size, 
+                       First_p_sz, Last_p_sz]);
+        _Err ->
+            io:format("Metrics not available~n", [])
     end.
 
 get_metrics() ->
-    Dests = lists:filter(fun({lb_pid, {Host, Port}, _}) when is_list(Host),
-                                                             is_integer(Port) ->
-                                 true;
-                            (_) ->
-                                 false
-                         end, ets:tab2list(ibrowse_lb)),
-    [get_lb_metrics(Host, Port, Lb_pid) || {lb_pid, {Host, Port}, Lb_pid} <- Dests].
-
-get_lb_metrics(Host, Port, Lb_pid) ->
-    Count = ibrowse_lb:get_request_count(Lb_pid),
-    {message_queue_len, MQL} = erlang:process_info(Lb_pid, message_queue_len),
-    {Host, Port, Lb_pid, MQL, Count}.
+    Dests = lists:filter(
+              fun(#lb_pid{host_port = {Host, Port}}) when is_list(Host),
+                                                          is_integer(Port) ->
+                      true;
+                 (_) ->
+                      false
+              end, ets:tab2list(ibrowse_lb)),
+    lists:foldl(
+      fun(#lb_pid{host_port = {X_host, X_port}}, X_acc) ->
+              case get_metrics(X_host, X_port) of
+                  {_, _, _, _, _} = X_res ->
+                      [{X_host, X_port, X_res} | X_acc];
+                  _X_res ->
+                      X_acc
+              end
+      end, [], Dests).
 
 get_metrics(Host, Port) ->
     case ets:lookup(ibrowse_lb, {Host, Port}) of
         [] ->
             no_active_processes;
-        [#lb_pid{pid = Lb_pid}] ->
-            get_lb_metrics(Host, Port, Lb_pid)
+        [#lb_pid{pid = Lb_pid, ets_tid = Tid}] ->
+            MsgQueueSize = case (catch process_info(Lb_pid, message_queue_len)) of
+			       {message_queue_len, Msg_q_len} ->
+				   Msg_q_len;
+			       _ ->
+				   -1
+			   end,
+            case Tid of
+                undefined ->
+                    {Lb_pid, MsgQueueSize, undefined, 0, {{0, 0}, {0, 0}}};
+                _ ->
+                    try
+                        Size = ets:info(Tid, size),
+                        case Size of
+                            0 ->
+                                {Lb_pid, MsgQueueSize, Tid, 0, {{0, 0}, {0, 0}}};
+                            _ ->
+                                {First_p_sz, _, _} = ets:first(Tid),
+                                {Last_p_sz, _, _} = ets:last(Tid),
+                                {Lb_pid, MsgQueueSize,
+                                 Tid, Size,
+                                 {{First_p_sz,  First_p_sz}, {Last_p_sz, Last_p_sz}}}
+                        end
+                    catch _:_Err ->
+                            not_available
+                    end
+            end
     end.
 
 %% @doc Clear current configuration for ibrowse and load from the file
@@ -883,7 +1020,6 @@ code_change(_OldVsn, State, _Extra) ->
 %%--------------------------------------------------------------------
 do_get_connection(#url{host = Host, port = Port}, []) ->
     {ok, Pid} = ibrowse_lb:start_link([Host, Port]),
-    ets:insert(ibrowse_lb, #lb_pid{host_port = {Host, Port}, pid = Pid}),
     Pid;
 do_get_connection(_Url, [#lb_pid{pid = Pid}]) ->
     Pid.
