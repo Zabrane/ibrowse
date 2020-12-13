@@ -15,9 +15,7 @@
 %% External exports
 -export([
          start_link/1,
-         start_link/2,
          start/1,
-         start/2,
          stop/1,
          send_req/7
         ]).
@@ -41,7 +39,7 @@
 
 -record(state, {host, port, connect_timeout,
                 inactivity_timer_ref,
-                use_proxy = false, proxy_auth_basic,
+                use_proxy = false, proxy_auth_digest,
                 ssl_options = [], is_ssl = false, socket,
                 proxy_tunnel_setup = false,
                 tunnel_setup_queue = [],
@@ -53,19 +51,17 @@
                 deleted_crlf = false, transfer_encoding,
                 chunk_size, chunk_size_buffer = <<>>,
                 recvd_chunk_size, interim_reply_sent = false,
-                lb_ets_tid, cur_pipeline_size = 0, prev_req_id,
-                proc_state
+                parent_lb, cur_pipeline_size = 0, prev_req_id
                }).
 
 -record(request, {url, method, options, from,
                   stream_to, caller_controls_socket = false,
                   caller_socket_options = [],
                   req_id,
-                  stream_full_chunks = false,
                   stream_chunk_size,
                   save_response_to_file = false,
                   tmp_file_name, tmp_file_fd, preserve_chunked_encoding,
-                  response_format, timer_ref, raw_req}).
+                  response_format, timer_ref}).
 
 -import(ibrowse_lib, [
                       get_value/2,
@@ -75,12 +71,6 @@
 
 -define(DEFAULT_STREAM_CHUNK_SIZE, 1024*1024).
 -define(dec2hex(X), erlang:integer_to_list(X, 16)).
-
-%% Macros to prevent spelling mistakes causing bugs
--define(dont_retry_pipelined_requests, dont_retry_pipelined_requests).
--define(can_retry_pipelined_requests, can_retry_pipelined_requests).
--define(dead_proc_walking, dead_proc_walking).
-
 %%====================================================================
 %% External functions
 %%====================================================================
@@ -89,16 +79,10 @@
 %% Description: Starts the server
 %%--------------------------------------------------------------------
 start(Args) ->
-    start(Args, []).
-
-start(Args, Options) ->
-    gen_server:start(?MODULE, Args, Options).
+    gen_server:start(?MODULE, Args, []).
 
 start_link(Args) ->
-    start_link(Args, []).
-
-start_link(Args, Options) ->
-    gen_server:start_link(?MODULE, Args, Options).
+    gen_server:start_link(?MODULE, Args, []).
 
 stop(Conn_pid) ->
     case catch gen_server:call(Conn_pid, stop) of
@@ -110,15 +94,9 @@ stop(Conn_pid) ->
     end.
 
 send_req(Conn_Pid, Url, Headers, Method, Body, Options, Timeout) ->
-    case catch gen_server:call(Conn_Pid,
-                               {send_req, {Url, Headers, Method, Body, Options, Timeout}}, Timeout) of
-        {'EXIT', {timeout, _}} ->
-            {error, req_timedout};
-        {'EXIT', {noproc, _}} ->
-            {error, connection_closed};
-        Res ->
-            Res
-    end.
+    gen_server:call(
+      Conn_Pid,
+      {send_req, {Url, Headers, Method, Body, Options, Timeout}}, Timeout).
 
 %%====================================================================
 %% Server functions
@@ -132,26 +110,24 @@ send_req(Conn_Pid, Url, Headers, Method, Body, Options, Timeout) ->
 %%          ignore               |
 %%          {stop, Reason}
 %%--------------------------------------------------------------------
-init({Lb_Tid, #url{host = Host, port = Port}, {SSLOptions, Is_ssl}}) ->
-    process_flag(trap_exit, true),
+init({Parent, #url{host = Host, port = Port}, {SSLOptions, Is_ssl}}) ->
     State = #state{host = Host,
                    port = Port,
                    ssl_options = SSLOptions,
                    is_ssl = Is_ssl,
-                   lb_ets_tid = Lb_Tid},
+                   parent_lb = Parent},
     put(ibrowse_trace_token, [Host, $:, integer_to_list(Port)]),
     put(my_trace_flag, ibrowse_lib:get_trace_status(Host, Port)),
     {ok, set_inac_timer(State)};
 init(Url) when is_list(Url) ->
-    process_flag(trap_exit, true),
     case catch ibrowse_lib:parse_url(Url) of
         #url{protocol = Protocol} = Url_rec ->
             init({undefined, Url_rec, {[], Protocol == https}});
         {'EXIT', _} ->
             {error, invalid_url}
     end;
-init({Host, Port}) ->
-    process_flag(trap_exit, true),
+init({Host, Port}) when is_list(Host),
+                        is_integer(Port) ->
     State = #state{host = Host,
                    port = Port},
     put(ibrowse_trace_token, [Host, $:, integer_to_list(Port)]),
@@ -171,10 +147,6 @@ init({Host, Port}) ->
 %% Received a request when the remote server has already sent us a
 %% Connection: Close header
 handle_call({send_req, _}, _From, #state{is_closing = true} = State) ->
-    {reply, {error, connection_closing}, State};
-
-handle_call({send_req, _}, _From, #state{proc_state = ?dead_proc_walking} = State) ->
-    shutting_down(State),
     {reply, {error, connection_closing}, State};
 
 handle_call({send_req, {Url, Headers, Method, Body, Options, Timeout}},
@@ -215,7 +187,7 @@ handle_info({ssl, _Sock, Data}, State) ->
 
 handle_info({stream_next, Req_id}, #state{socket = Socket,
                                           cur_req = #request{req_id = Req_id}} = State) ->
-    _ = do_setopts(Socket, [{active, once}], State),
+    do_setopts(Socket, [{active, once}], State),
     {noreply, set_inac_timer(State)};
 
 handle_info({stream_next, _Req_id}, State) ->
@@ -228,73 +200,50 @@ handle_info({stream_next, _Req_id}, State) ->
     {noreply, State};
 
 handle_info({stream_close, _Req_id}, State) ->
-    State_1 = State#state{proc_state = ?dead_proc_walking},
-    shutting_down(State_1),
-    do_close(State_1),
-    do_error_reply(State_1, closing_on_request),
-    delayed_stop_timer(),
-    {noreply, State_1};
+    shutting_down(State),
+    do_close(State),
+    do_error_reply(State, closing_on_request),
+    {stop, normal, State};
 
 handle_info({tcp_closed, _Sock}, State) ->
     do_trace("TCP connection closed by peer!~n", []),
-    State_1 = State#state{proc_state = ?dead_proc_walking},
-    handle_sock_closed(State_1, ?can_retry_pipelined_requests),
-    delayed_stop_timer(),
-    {noreply, State_1};
+    handle_sock_closed(State),
+    {stop, normal, State};
 handle_info({ssl_closed, _Sock}, State) ->
     do_trace("SSL connection closed by peer!~n", []),
-    State_1 = State#state{proc_state = ?dead_proc_walking},
-    handle_sock_closed(State_1, ?can_retry_pipelined_requests),
-    delayed_stop_timer(),
-    {noreply, State_1};
+    handle_sock_closed(State),
+    {stop, normal, State};
 
 handle_info({tcp_error, _Sock, Reason}, State) ->
     do_trace("Error on connection to ~1000.p:~1000.p -> ~1000.p~n",
              [State#state.host, State#state.port, Reason]),
-    State_1 = State#state{proc_state = ?dead_proc_walking},
-    handle_sock_closed(State_1, ?dont_retry_pipelined_requests),
-    delayed_stop_timer(),
-    {noreply, State_1};
+    handle_sock_closed(State),
+    {stop, normal, State};
 handle_info({ssl_error, _Sock, Reason}, State) ->
     do_trace("Error on SSL connection to ~1000.p:~1000.p -> ~1000.p~n",
              [State#state.host, State#state.port, Reason]),
-    State_1 = State#state{proc_state = ?dead_proc_walking},
-    handle_sock_closed(State_1, ?dont_retry_pipelined_requests),
-    delayed_stop_timer(),
-    {noreply, State_1};
+    handle_sock_closed(State),
+    {stop, normal, State};
 
-handle_info({req_timedout, From}, #state{reqs = Reqs} = State) ->
-    Reqs_list = queue:to_list(Reqs),
-    case lists:keysearch(From, #request.from, Reqs_list) of
+handle_info({req_timedout, From}, State) ->
+    case lists:keymember(From, #request.from, queue:to_list(State#state.reqs)) of
         false ->
             {noreply, State};
-        {value, #request{stream_to = StreamTo, req_id = ReqId}} ->
-            catch StreamTo ! {ibrowse_async_response_timeout, ReqId},
-            State_1 = State#state{proc_state = ?dead_proc_walking},
-            shutting_down(State_1),
-            Reqs_1 = lists:filter(fun(#request{from = X_from}) ->
-                                          X_from /= From
-                                  end, Reqs_list),
-            State_2 = State_1#state{reqs = queue:from_list(Reqs_1)},
-            do_error_reply(State_2, req_timedout),
-            delayed_stop_timer(),
-            {noreply, State_2}
+        true ->
+            shutting_down(State),
+%%            do_error_reply(State, req_timedout),
+            {stop, normal, State}
     end;
 
 handle_info(timeout, State) ->
     do_trace("Inactivity timeout triggered. Shutting down connection~n", []),
-    State_1 = State#state{proc_state = ?dead_proc_walking},
-    shutting_down(State_1),
-    do_error_reply(State_1, req_timedout),
-    delayed_stop_timer(),
-    {noreply, State_1};
+    shutting_down(State),
+    do_error_reply(State, req_timedout),
+    {stop, normal, State};
 
 handle_info({trace, Bool}, State) ->
     put(my_trace_flag, Bool),
     {noreply, State};
-
-handle_info(delayed_stop, State) ->
-    {stop, normal, State};
 
 handle_info(Info, State) ->
     io:format("Unknown message recvd for ~1000.p:~1000.p -> ~p~n",
@@ -307,10 +256,8 @@ handle_info(Info, State) ->
 %% Description: Shutdown the server
 %% Returns: any (ignored by gen_server)
 %%--------------------------------------------------------------------
-terminate(_Reason, #state{lb_ets_tid = Tid} = State) ->
+terminate(_Reason, State) ->
     do_close(State),
-    shutting_down(State),
-    (catch ets:select_delete(Tid, [{{{'_','_','$1'},'_'},[{'==','$1',{const,self()}}],[true]}])),
     ok.
 
 %%--------------------------------------------------------------------
@@ -330,27 +277,23 @@ code_change(_OldVsn, State, _Extra) ->
 %%--------------------------------------------------------------------
 handle_sock_data(Data, #state{status=idle}=State) ->
     do_trace("Data recvd on socket in state idle!. ~1000.p~n", [Data]),
-    State_1 = State#state{proc_state = ?dead_proc_walking},
-    shutting_down(State_1),
-    do_error_reply(State_1, data_in_status_idle),
-    do_close(State_1),
-    delayed_stop_timer(),
-    {noreply, State_1};
+    shutting_down(State),
+    do_error_reply(State, data_in_status_idle),
+    do_close(State),
+    {stop, normal, State};
 
 handle_sock_data(Data, #state{status = get_header}=State) ->
     case parse_response(Data, State) of
         {error, _Reason} ->
-            State_1 = State#state{proc_state = ?dead_proc_walking},
-            shutting_down(State_1),
-            delayed_stop_timer(),
-            {noreply, State_1};
+            shutting_down(State),
+            {stop, normal, State};
         #state{socket = Socket, status = Status, cur_req = CurReq} = State_1 ->
-            _ = case {Status, CurReq} of
-		    {get_header, #request{caller_controls_socket = true}} ->
-			do_setopts(Socket, [{active, once}], State_1);
-		    _ ->
-			active_once(State_1)
-		end,
+            case {Status, CurReq} of
+                {get_header, #request{caller_controls_socket = true}} ->
+                    do_setopts(Socket, [{active, once}], State_1);
+                _ ->
+                    active_once(State_1)
+            end,
             {noreply, set_inac_timer(State_1)}
     end;
 
@@ -364,36 +307,32 @@ handle_sock_data(Data, #state{status           = get_body,
         true ->
             case accumulate_response(Data, State) of
                 {error, Reason} ->
-                    State_1 = State#state{proc_state = ?dead_proc_walking},
-                    shutting_down(State_1),
-                    fail_pipelined_requests(State_1,
+                    shutting_down(State),
+                    fail_pipelined_requests(State,
                                             {error, {Reason, {stat_code, StatCode}, Headers}}),
-                    delayed_stop_timer(),
-                    {noreply, State_1};
+                    {stop, normal, State};
                 State_1 ->
-                    _ = active_once(State_1),
+                    active_once(State_1),
                     State_2 = set_inac_timer(State_1),
                     {noreply, State_2}
             end;
         _ ->
             case parse_11_response(Data, State) of
                 {error, Reason} ->
-                    State_1 = State#state{proc_state = ?dead_proc_walking},
-                    shutting_down(State_1),
-                    fail_pipelined_requests(State_1,
+                    shutting_down(State),
+                    fail_pipelined_requests(State,
                                             {error, {Reason, {stat_code, StatCode}, Headers}}),
-                    delayed_stop_timer(),
-                    {noreply, State_1};
+                    {stop, normal, State};
                 #state{cur_req = #request{caller_controls_socket = Ccs},
                        interim_reply_sent = Irs} = State_1 ->
-                    _ = case Irs of
-			    true ->
-				active_once(State_1);
-			    false when Ccs == true ->
-				do_setopts(Socket, [{active, once}], State);
-			    false ->
-				active_once(State_1)
-			end,
+                    case Irs of
+                        true ->
+                            active_once(State_1);
+                        false when Ccs == true ->
+                            do_setopts(Socket, [{active, once}], State);
+                        false ->
+                            active_once(State_1)
+                    end,
                     State_2 = State_1#state{interim_reply_sent = false},
                     case Ccs of
                     true ->
@@ -403,7 +342,7 @@ handle_sock_data(Data, #state{status           = get_body,
                         {noreply, set_inac_timer(State_2)}
                     end;
                 State_1 ->
-                    _ = active_once(State_1),
+                    active_once(State_1),
                     State_2 = set_inac_timer(State_1),
                     {noreply, State_2}
             end
@@ -486,7 +425,7 @@ accumulate_response(Data, #state{reply_buffer      = RepBuf,
 
 make_tmp_filename(true) ->
     DownloadDir = ibrowse:get_config_value(download_dir, filename:absname("./")),
-    {A,B,C} = os:timestamp(),
+    {A,B,C} = now(),
     filename:join([DownloadDir,
                    "ibrowse_tmp_file_"++
                    integer_to_list(A) ++
@@ -504,11 +443,11 @@ file_mode(_Srtf) -> write.
 %%--------------------------------------------------------------------
 %% Handles the case when the server closes the socket
 %%--------------------------------------------------------------------
-handle_sock_closed(#state{status=get_header} = State, _) ->
+handle_sock_closed(#state{status=get_header} = State) ->
     shutting_down(State),
-    do_error_reply(State, connection_closed_no_retry);
+    do_error_reply(State, connection_closed);
 
-handle_sock_closed(#state{cur_req=undefined} = State, _) ->
+handle_sock_closed(#state{cur_req=undefined} = State) ->
     shutting_down(State);
 
 %% We check for IsClosing because this the server could have sent a
@@ -522,12 +461,10 @@ handle_sock_closed(#state{reply_buffer = Buf, reqs = Reqs, http_status_code = SC
                           recvd_headers = Headers,
                           status_line = Status_line,
                           raw_headers = Raw_headers
-                         }=State, Retry_state) ->
+                         }=State) ->
     #request{from=From, stream_to=StreamTo, req_id=ReqId,
              response_format = Resp_format,
-             options = Options,
-             raw_req = Raw_req
-            } = CurReq,
+             options = Options} = CurReq,
     case IsClosing of
         true ->
             {_, Reqs_1} = queue:out(Reqs),
@@ -538,32 +475,17 @@ handle_sock_closed(#state{reply_buffer = Buf, reqs = Reqs, http_status_code = SC
                            ok = file:close(Fd),
                            {file, TmpFilename}
                    end,
-            Give_raw_req = get_value(return_raw_request, Options, false),
             Reply = case get_value(give_raw_headers, Options, false) of
-                        true when Give_raw_req == false->
+                          true ->
                             {ok, Status_line, Raw_headers, Body};
-                        true ->
-                            {ok, Status_line, Raw_headers, Body, Raw_req};
-                        false when Give_raw_req == false ->
-                            {ok, SC, Headers, Body};
                         false ->
-                            {ok, SC, Headers, Body, Raw_req}
+                            {ok, SC, Headers, Buf}
                     end,
             State_1 = do_reply(State, From, StreamTo, ReqId, Resp_format, Reply),
-            case Retry_state of
-                ?dont_retry_pipelined_requests ->
-                    ok = do_error_reply(State_1#state{reqs = Reqs_1}, connection_closed_no_retry);
-                ?can_retry_pipelined_requests ->
-                    ok = do_error_reply(State_1#state{reqs = Reqs_1}, connection_closed)
-            end,
+            ok = do_error_reply(State_1#state{reqs = Reqs_1}, connection_closed),
             State_1;
         _ ->
-            case Retry_state of
-                ?dont_retry_pipelined_requests ->
-                    ok = do_error_reply(State, connection_closed_no_retry);
-                ?can_retry_pipelined_requests ->
-                    ok = do_error_reply(State, connection_closed)
-            end,
+            ok = do_error_reply(State, connection_closed),
             State
     end.
 
@@ -571,52 +493,18 @@ do_connect(Host, Port, Options, #state{is_ssl      = true,
                                        use_proxy   = false,
                                        ssl_options = SSLOptions},
            Timeout) ->
-    %% if a socks5 proxy is configured, open the socket separately
-    %% before upgrading the socket to a TLS connection.
-    case get_value(socks5_host, Options, undefined) of
-        %% no socks5 proxy is configured, connect directly with TLS:
-        undefined ->
-            Sock_options = get_sock_options(Host, Options, SSLOptions),
-            ssl:connect(Host, Port, Sock_options, Timeout);
-
-        %% proxy configuration is present: first establish a socket
-        %% and then upgrade:
-        _ ->
-            Sock_options = get_sock_options(Host, Options, []),
-            Conn = ibrowse_socks5:connect(Host, Port, Options,
-                                          Sock_options, Timeout),
-            case Conn of
-                {ok, Sock} ->
-                    ssl:connect(Sock, SSLOptions, Timeout);
-                _ ->
-                    error
-            end
-    end;
-
+    ssl:connect(Host, Port, get_sock_options(Host, Options, SSLOptions), Timeout);
 do_connect(Host, Port, Options, _State, Timeout) ->
-    Socks5Host = get_value(socks5_host, Options, undefined),
-    Sock_options = get_sock_options(Host, Options, []),
-    case Socks5Host of
-      undefined ->
-        gen_tcp:connect(Host, Port, Sock_options, Timeout);
-      _ ->
-        catch ibrowse_socks5:connect(Host, Port, Options, Sock_options, Timeout)
-    end.
+    gen_tcp:connect(Host, Port, get_sock_options(Host, Options, []), Timeout).
 
 get_sock_options(Host, Options, SSLOptions) ->
     Caller_socket_options = get_value(socket_options, Options, []),
-    PreferIPv6 = get_value(prefer_ipv6, Options, false),
-    Ipv6Options = case PreferIPv6 of
-                      true ->
-                          case is_ipv6_host(Host) of
-                              true ->
-                                  [inet6];
-                              false ->
-                                  []
-                          end;
-                      false ->
-                          []
-                  end,
+    Ipv6Options = case is_ipv6_host(Host) of
+        true ->
+            [inet6];
+        false ->
+            []
+    end,
     Other_sock_options = filter_sock_options(SSLOptions ++ Caller_socket_options ++ Ipv6Options),
     case lists:keysearch(nodelay, 1, Other_sock_options) of
         false ->
@@ -632,7 +520,7 @@ is_ipv6_host(Host) ->
         {ok, {_, _, _, _}} ->
             false;
         _  ->
-            case inet:gethostbyname(Host, inet6) of
+            case inet:gethostbyname(Host) of
                 {ok, #hostent{h_addrtype = inet6}} ->
                     true;
                 _ ->
@@ -659,77 +547,37 @@ do_send(Req, #state{socket = Sock,
 do_send(Req, #state{socket = Sock, is_ssl = true})  ->  ssl:send(Sock, Req);
 do_send(Req, #state{socket = Sock, is_ssl = false}) ->  gen_tcp:send(Sock, Req).
 
+%% @spec do_send_body(Sock::socket_descriptor(), Source::source_descriptor(), IsSSL::boolean()) -> ok | error()
+%% source_descriptor() = fun_arity_0           |
+%%                       {fun_arity_0}         |
+%%                       {fun_arity_1, term()}
+%% error() = term()
 do_send_body(Source, State, TE) when is_function(Source) ->
     do_send_body({Source}, State, TE);
 do_send_body({Source}, State, TE) when is_function(Source) ->
-    do_send_body_1(generate_body(Source),
-                   State, TE, []);
+    do_send_body1(Source, Source(), State, TE);
 do_send_body({Source, Source_state}, State, TE) when is_function(Source) ->
-    do_send_body_1(generate_body({Source, Source_state}),
-                   State, TE, []);
+    do_send_body1(Source, Source(Source_state), State, TE);
 do_send_body(Body, State, _TE) ->
-    case do_send(Body, State) of
-        ok ->
-            {ok, Body};
-        Ret ->
-            Ret
-    end.
+    do_send(Body, State).
 
-generate_body({Source, Source_state} = In) when is_function(Source) ->
-    case Source(Source_state) of
-        {ok, Data, Source_state_1} ->
-            {{ok, Data, Source_state_1}, Source};
-        {eof, Source_state_1} ->
-            {{eof, Source_state_1}, Source};
-        eof ->
-            {eof, Source};
-        Ret ->
-            {Ret, In}
-    end;
-generate_body(Source) when is_function(Source) ->
-    {Source(), Source}.
-
-do_send_body_1({Resp, Source}, State, TE, Acc) when is_function(Source) ->
+do_send_body1(Source, Resp, State, TE) ->
     case Resp of
-        {ok, Data} when Data == []; Data == <<>> ->
-            do_send_body_1(generate_body(Source), State, TE, Acc);
+                {ok, Data} when Data == []; Data == <<>> ->
+                        do_send_body({Source}, State, TE);
         {ok, Data} ->
-            Acc_1 = case TE of
-                        true ->
-                            ok = do_send(maybe_chunked_encode(Data, TE), State),
-                            Acc;
-                        false ->
-                            [Data | Acc]
-                    end,
-            do_send_body_1(generate_body(Source), State, TE, Acc_1);
-        {ok, Data, New_source_state} when Data == []; Data == <<>> ->
-            do_send_body_1(generate_body({Source, New_source_state}), State, TE, Acc);
+            do_send(maybe_chunked_encode(Data, TE), State),
+            do_send_body({Source}, State, TE);
+                {ok, Data, New_source_state} when Data == []; Data == <<>> ->
+                        do_send_body({Source, New_source_state}, State, TE);
         {ok, Data, New_source_state} ->
-            Acc_1 = case TE of
-                        true ->
-                            ok = do_send(maybe_chunked_encode(Data, TE), State),
-                            Acc;
-                        false ->
-                            [Data | Acc]
-                    end,
-            do_send_body_1(generate_body({Source, New_source_state}), State, TE, Acc_1);
-        {eof, _New_source_state} ->
-            case TE of
-                true ->
-                    ok = do_send(<<"0\r\n\r\n">>, State),
-                    {ok, []};
-                _ ->
-                    Body = list_to_binary(lists:reverse(Acc)),
-                    ok = do_send(Body, State),
-                    {ok, Body}
-            end;
+            do_send(maybe_chunked_encode(Data, TE), State),
+            do_send_body({Source, New_source_state}, State, TE);
         eof when TE == true ->
-            ok = do_send(<<"0\r\n\r\n">>, State),
-            {ok, []};
+            do_send(<<"0\r\n\r\n">>, State),
+            ok;
         eof ->
-            Body = list_to_binary(lists:reverse(Acc)),
-            ok = do_send(Body, State),
-            {ok, Body};
+            ok;
         Err ->
             Err
     end.
@@ -751,7 +599,7 @@ do_close(#state{socket = Sock, is_ssl = false}) ->  catch gen_tcp:close(Sock).
 active_once(#state{cur_req = #request{caller_controls_socket = true}}) ->
     ok;
 active_once(#state{socket = Socket} = State) ->
-    _ = do_setopts(Socket, [{active, once}], State).
+    do_setopts(Socket, [{active, once}], State).
 
 do_setopts(_Sock, [],   _)    ->  ok;
 do_setopts(Sock, Opts, #state{is_ssl = true,
@@ -781,10 +629,10 @@ send_req_1(From,
             PHost ->
                 ProxyUser     = get_value(proxy_user, Options, []),
                 ProxyPassword = get_value(proxy_password, Options, []),
-                AuthBasic        = http_auth_basic(ProxyUser, ProxyPassword),
+                Digest        = http_auth_digest(ProxyUser, ProxyPassword),
                 {PHost, get_value(proxy_port, Options, 80),
                  State#state{use_proxy = true,
-                             proxy_auth_basic = AuthBasic}}
+                             proxy_auth_digest = Digest}}
         end,
     State_2 = check_ssl_options(Options, State_1),
     do_trace("Connecting...~n", []),
@@ -796,12 +644,10 @@ send_req_1(From,
                                     connect_timeout = Conn_timeout},
             send_req_1(From, Url, Headers, Method, Body, Options, Timeout, State_3);
         Err ->
-            State_3 = State_2#state{proc_state = ?dead_proc_walking},
-            shutting_down(State_3),
+            shutting_down(State_2),
             do_trace("Error connecting. Reason: ~1000.p~n", [Err]),
             gen_server:reply(From, {error, {conn_failed, Err}}),
-            delayed_stop_timer(),
-            {noreply, State_3}
+            {stop, normal, State_2}
     end;
 
 %% Send a CONNECT request.
@@ -842,9 +688,9 @@ send_req_1(From,
     case do_send(Req, State) of
         ok ->
             case do_send_body(Body_1, State_1, TE) of
-                {ok, _Sent_body} ->
+                ok ->
                     trace_request_body(Body_1),
-                    _ = active_once(State_1),
+                    active_once(State_1),
                     State_1_1 = inc_pipeline_counter(State_1),
                     State_2 = State_1_1#state{status     = get_header,
                                               cur_req    = NewReq,
@@ -853,20 +699,16 @@ send_req_1(From,
                     State_3 = set_inac_timer(State_2),
                     {noreply, State_3};
                 Err ->
-                    State_2 = State_1#state{proc_state = ?dead_proc_walking},
-                    shutting_down(State_2),
+                    shutting_down(State_1),
                     do_trace("Send failed... Reason: ~p~n", [Err]),
                     gen_server:reply(From, {error, {send_failed, Err}}),
-                    delayed_stop_timer(),
-                    {noreply, State_2}
+                    {stop, normal, State_1}
             end;
         Err ->
-            State_2 = State_1#state{proc_state = ?dead_proc_walking},
-            shutting_down(State_2),
+            shutting_down(State_1),
             do_trace("Send failed... Reason: ~p~n", [Err]),
             gen_server:reply(From, {error, {send_failed, Err}}),
-            delayed_stop_timer(),
-            {noreply, State_2}
+            {stop, normal, State_1}
     end;
 
 send_req_1(From, Url, Headers, Method, Body, Options, Timeout,
@@ -910,11 +752,6 @@ send_req_1(From,
               _ ->
                   erlang:send_after(Timeout, self(), {req_timedout, From})
           end,
-    Headers_1 = maybe_modify_headers(Url, Method, Options, Headers, State),
-    {Req, Body_1} = make_request(Method,
-                                 Headers_1,
-                                 AbsPath, RelPath, Body, Options, State,
-                                 ReqId),
     NewReq = #request{url                    = Url,
                       method                 = Method,
                       stream_to              = StreamTo,
@@ -923,31 +760,32 @@ send_req_1(From,
                       options                = Options,
                       req_id                 = ReqId,
                       save_response_to_file  = SaveResponseToFile,
-                      stream_full_chunks     = get_value(stream_full_chunks, Options, false),
                       stream_chunk_size      = get_stream_chunk_size(Options),
                       response_format        = Resp_format,
                       from                   = From,
                       preserve_chunked_encoding = get_value(preserve_chunked_encoding, Options, false),
                       timer_ref              = Ref
                      },
+    State_1 = State#state{reqs=queue:in(NewReq, State#state.reqs)},
+    Headers_1 = maybe_modify_headers(Url, Method, Options, Headers, State_1),
+    {Req, Body_1} = make_request(Method,
+                                 Headers_1,
+                                 AbsPath, RelPath, Body, Options, State_1,
+                                 ReqId),
     trace_request(Req),
-    ok = do_setopts(Socket, Caller_socket_options, State),
+    do_setopts(Socket, Caller_socket_options, State_1),
     TE = is_chunked_encoding_specified(Options),
-    case do_send(Req, State) of
+    case do_send(Req, State_1) of
         ok ->
-            case do_send_body(Body_1, State, TE) of
-                {ok, Sent_body} ->
-                    trace_request_body(Sent_body),
-                    Raw_req = list_to_binary([Req, Sent_body]),
-                    NewReq_1 = NewReq#request{raw_req = Raw_req},
-                    State_1 = State#state{reqs=queue:in(NewReq_1, State#state.reqs)},
+            case do_send_body(Body_1, State_1, TE) of
+                ok ->
+                    trace_request_body(Body_1),
                     State_2 = inc_pipeline_counter(State_1),
-                    _ = active_once(State_2),
+                    active_once(State_2),
                     State_3 = case Status of
                                   idle ->
-                                      State_2#state{
-                                        status     = get_header,
-                                        cur_req    = NewReq_1};
+                                      State_2#state{status     = get_header,
+                                                    cur_req    = NewReq};
                                   _ ->
                                       State_2
                               end,
@@ -955,31 +793,21 @@ send_req_1(From,
                         undefined ->
                             ok;
                         _ ->
-                            gen_server:reply(From, {ibrowse_req_id, ReqId}),
-                            case get_value(return_raw_request, Options, false) of
-                                false ->
-                                    ok;
-                                true ->
-                                    catch StreamTo ! {ibrowse_async_raw_req, Raw_req}
-                            end
+                            gen_server:reply(From, {ibrowse_req_id, ReqId})
                     end,
                     State_4 = set_inac_timer(State_3),
                     {noreply, State_4};
                 Err ->
-                    State_2 = State#state{proc_state = ?dead_proc_walking},
-                    shutting_down(State_2),
+                    shutting_down(State_1),
                     do_trace("Send failed... Reason: ~p~n", [Err]),
                     gen_server:reply(From, {error, {send_failed, Err}}),
-                    delayed_stop_timer(),
-                    {noreply, State_2}
+                    {stop, normal, State_1}
             end;
         Err ->
-            State_2 = State#state{proc_state = ?dead_proc_walking},
-            shutting_down(State_2),
+            shutting_down(State_1),
             do_trace("Send failed... Reason: ~p~n", [Err]),
             gen_server:reply(From, {error, {send_failed, Err}}),
-            delayed_stop_timer(),
-            {noreply, State_2}
+            {stop, normal, State_1}
     end.
 
 maybe_modify_headers(#url{}, connect, _, Headers, State) ->
@@ -1016,23 +844,23 @@ add_auth_headers(#url{username = User,
                             undefined ->
                                 Headers;
                             {U,P} ->
-                                [{"Authorization", ["Basic ", http_auth_basic(U, P)]} | Headers]
+                                [{"Authorization", ["Basic ", http_auth_digest(U, P)]} | Headers]
                         end;
                     _ ->
-                        [{"Authorization", ["Basic ", http_auth_basic(User, UPw)]} | Headers]
+                        [{"Authorization", ["Basic ", http_auth_digest(User, UPw)]} | Headers]
                 end,
     add_proxy_auth_headers(State, Headers_1).
 
 add_proxy_auth_headers(#state{use_proxy = false}, Headers) ->
     Headers;
-add_proxy_auth_headers(#state{proxy_auth_basic = []}, Headers) ->
+add_proxy_auth_headers(#state{proxy_auth_digest = []}, Headers) ->
     Headers;
-add_proxy_auth_headers(#state{proxy_auth_basic = Auth_basic}, Headers) ->
-    [{"Proxy-Authorization", ["Basic ", Auth_basic]} | Headers].
+add_proxy_auth_headers(#state{proxy_auth_digest = Auth_digest}, Headers) ->
+    [{"Proxy-Authorization", ["Basic ", Auth_digest]} | Headers].
 
-http_auth_basic([], []) ->
+http_auth_digest([], []) ->
     [];
-http_auth_basic(Username, Password) ->
+http_auth_digest(Username, Password) ->
     ibrowse_lib:encode_base64(Username ++ [$: | Password]).
 
 make_request(Method, Headers, AbsPath, RelPath, Body, Options,
@@ -1040,7 +868,7 @@ make_request(Method, Headers, AbsPath, RelPath, Body, Options,
     HttpVsn = http_vsn_string(get_value(http_vsn, Options, {1,1})),
     Fun1 = fun({X, Y}) when is_atom(X) ->
                    {to_lower(atom_to_list(X)), X, Y};
-              ({X, Y}) when is_list(X); is_binary(X) ->
+              ({X, Y}) when is_list(X) ->
                    {to_lower(X), X, Y}
            end,
     Headers_0 = [Fun1(X) || X <- Headers],
@@ -1126,7 +954,7 @@ encode_headers(L) ->
     encode_headers(L, []).
 encode_headers([{http_vsn, _Val} | T], Acc) ->
     encode_headers(T, Acc);
-encode_headers([{Name,Val} | T], Acc) when is_list(Name); is_binary(Name) ->
+encode_headers([{Name,Val} | T], Acc) when is_list(Name) ->
     encode_headers(T, [[Name, ": ", fmt_val(Val), crnl()] | Acc]);
 encode_headers([{Name,Val} | T], Acc) when is_atom(Name) ->
     encode_headers(T, [[atom_to_list(Name), ": ", fmt_val(Val), crnl()] | Acc]);
@@ -1177,8 +1005,7 @@ parse_response(Data, #state{reply_buffer = Acc, reqs = Reqs,
                             cur_req = CurReq} = State) ->
     #request{from=From, stream_to=StreamTo, req_id=ReqId,
              method=Method, response_format = Resp_format,
-             options = Options, timer_ref = T_ref,
-             raw_req = Raw_req
+             options = Options, timer_ref = T_ref
             } = CurReq,
     MaxHeaderSize = ibrowse:get_config_value(max_headers_size, infinity),
     case scan_header(Acc, Data) of
@@ -1187,8 +1014,8 @@ parse_response(Data, #state{reply_buffer = Acc, reqs = Reqs,
             do_trace("Recvd headers~n--- Headers Begin ---~n~s~n--- Headers End ---~n~n", [Headers]),
             {HttpVsn, StatCode, Headers_1, Status_line, Raw_headers} = parse_headers(Headers),
             do_trace("HttpVsn: ~p StatusCode: ~p Headers_1 -> ~1000.p~n", [HttpVsn, StatCode, Headers_1]),
-            LCHeaders = [{to_lower(X), Y} || {X,Y} <- Headers_1],
-            ConnClose = to_lower(get_header_value("connection", LCHeaders, "false")),
+            LCHeaders = [{to_lower(binary_to_list(X)), binary_to_list(Y)} || {X,Y} <- Headers_1],
+            ConnClose = to_lower(get_value("connection", LCHeaders, "false")),
             IsClosing = is_connection_closing(HttpVsn, ConnClose),
             State_0 = case IsClosing of
                           true ->
@@ -1198,7 +1025,6 @@ parse_response(Data, #state{reply_buffer = Acc, reqs = Reqs,
                               State
                       end,
             Give_raw_headers = get_value(give_raw_headers, Options, false),
-            Give_raw_req = get_value(return_raw_request, Options, false),
             State_1 = case Give_raw_headers of
                           true ->
                               State_0#state{recvd_headers=Headers_1, status=get_body,
@@ -1208,16 +1034,13 @@ parse_response(Data, #state{reply_buffer = Acc, reqs = Reqs,
                                             http_status_code=StatCode};
                           false ->
                               State_0#state{recvd_headers=Headers_1, status=get_body,
-                                            status_line = Status_line,
                                             reply_buffer = <<>>,
                                             http_status_code=StatCode}
                       end,
             put(conn_close, ConnClose),
-            TransferEncodings = to_lower(get_header_value("transfer-encoding", LCHeaders, "false")),
-            IsChunked = lists:any(fun(Enc) -> string:strip(Enc) =:= "chunked" end,
-                                  string:tokens(TransferEncodings, ",")),
+            TransferEncoding = to_lower(get_value("transfer-encoding", LCHeaders, "false")),
             Head_response_with_body = lists:member({workaround, head_response_with_body}, Options),
-            case get_header_value("content-length", LCHeaders, undefined) of
+            case get_value("content-length", LCHeaders, undefined) of
                 _ when Method == connect,
                        hd(StatCode) == $2 ->
                     {_, Reqs_1} = queue:out(Reqs),
@@ -1240,13 +1063,8 @@ parse_response(Data, #state{reply_buffer = Acc, reqs = Reqs,
                     %% there was still a body.  Issue #67 on Github
                     {_, Reqs_1} = queue:out(Reqs),
                     send_async_headers(ReqId, StreamTo, Give_raw_headers, State_1),
-                    Reply = case Give_raw_req of
-                                false ->
-                                    {ok, StatCode, Headers_1, []};
-                                true ->
-                                    {ok, StatCode, Headers_1, [], Raw_req}
-                            end,
-                    State_1_1 = do_reply(State_1, From, StreamTo, ReqId, Resp_format, Reply),
+                    State_1_1 = do_reply(State_1, From, StreamTo, ReqId, Resp_format,
+                                         {ok, StatCode, Headers_1, []}),
                     cancel_timer(T_ref, {eat_message, {req_timedout, From}}),
                     State_2 = reset_state(State_1_1),
                     State_3 = set_cur_request(State_2#state{reqs = Reqs_1}),
@@ -1265,18 +1083,13 @@ parse_response(Data, #state{reply_buffer = Acc, reqs = Reqs,
                     %% RFC2616 - Sec 4.4
                     {_, Reqs_1} = queue:out(Reqs),
                     send_async_headers(ReqId, StreamTo, Give_raw_headers, State_1),
-                    Reply = case Give_raw_req of
-                                false ->
-                                    {ok, StatCode, Headers_1, []};
-                                true ->
-                                    {ok, StatCode, Headers_1, [], Raw_req}
-                            end,
-                    State_1_1 = do_reply(State_1, From, StreamTo, ReqId, Resp_format, Reply),
+                    State_1_1 = do_reply(State_1, From, StreamTo, ReqId, Resp_format,
+                                         {ok, StatCode, Headers_1, []}),
                     cancel_timer(T_ref, {eat_message, {req_timedout, From}}),
                     State_2 = reset_state(State_1_1),
                     State_3 = set_cur_request(State_2#state{reqs = Reqs_1}),
                     parse_response(Data_1, State_3);
-                _ when IsChunked ->
+                _ when TransferEncoding =:= <<"chunked">> ->
                     do_trace("Chunked encoding detected...~n",[]),
                     send_async_headers(ReqId, StreamTo, Give_raw_headers, State_1),
                     case parse_11_response(Data_1, State_1#state{transfer_encoding=chunked,
@@ -1293,26 +1106,7 @@ parse_response(Data, #state{reply_buffer = Acc, reqs = Reqs,
                 undefined when HttpVsn =:= "HTTP/1.0";
                                ConnClose =:= "close" ->
                     send_async_headers(ReqId, StreamTo, Give_raw_headers, State_1),
-                    accumulate_response(Data_1, State_1);
-                undefined when StatCode =:= "303" ->
-                    %% Some servers send 303 requests without a body.
-                    %% RFC2616 says that they SHOULD, but they dont.
-                    case ibrowse:get_config_value(allow_303_with_no_body, false) of
-                      false ->
-                        fail_pipelined_requests(State_1,
-                                            {error, {content_length_undefined,
-                                                     {stat_code, StatCode}, Headers}}),
-                       {error, content_length_undefined};
-                      true ->
-                        {_, Reqs_1} = queue:out(Reqs),
-                        send_async_headers(ReqId, StreamTo, Give_raw_headers, State_1),
-                        State_1_1 = do_reply(State_1, From, StreamTo, ReqId, Resp_format,
-                                             {ok, StatCode, Headers_1, []}),
-                        cancel_timer(T_ref, {eat_message, {req_timedout, From}}),
-                        State_2 = reset_state(State_1_1),
-                        State_3 = set_cur_request(State_2#state{reqs = Reqs_1}),
-                        parse_response(Data_1, State_3)
-                    end;
+                    State_1#state{reply_buffer = Data_1};
                 undefined ->
                     fail_pipelined_requests(State_1,
                                             {error, {content_length_undefined,
@@ -1466,41 +1260,22 @@ parse_11_response(DataRecvd,
                   #state{transfer_encoding = chunked,
                          chunk_size = CSz,
                          recvd_chunk_size = Recvd_csz,
-                         reply_buffer = RepBuf,
-                         rep_buf_size = RepBufSz,
-                         streamed_size = Streamed_size,
-                         cur_req = CurReq} = State) ->
+                         rep_buf_size = RepBufSz} = State) ->
     NeedBytes = CSz - Recvd_csz,
     DataLen = size(DataRecvd),
     do_trace("Recvd more data: size: ~p. NeedBytes: ~p~n", [DataLen, NeedBytes]),
     case DataLen >= NeedBytes of
         true ->
             {RemChunk, RemData} = split_binary(DataRecvd, NeedBytes),
-            case CurReq of
-                #request{stream_to = StreamTo, caller_controls_socket = false, req_id = ReqId, stream_full_chunks = true, response_format = Response_format} ->
-                    Chunk = <<RepBuf/binary, RemChunk/binary>>,
-                    do_trace("Recvd another chunk...~p~n", [Chunk]),
-                    do_trace("RemData -> ~p~n", [RemData]),
-                    do_interim_reply(StreamTo, Response_format, ReqId, Chunk),
-                    State_1 = State#state{
-                                reply_buffer = <<>>,
-                                rep_buf_size = RepBufSz + size(RemChunk),
-                                interim_reply_sent = true,
-                                streamed_size = Streamed_size + CSz,
-                                chunk_size = tbd,
-                                recvd_chunk_size = 0},
-                    parse_11_response(RemData, State_1);
-                _ ->
-                    do_trace("Recvd another chunk...~p~n", [RemChunk]),
-                    do_trace("RemData -> ~p~n", [RemData]),
-                    case accumulate_response(RemChunk, State) of
-                        {error, Reason} ->
-                            do_trace("Error accumulating response --> ~p~n", [Reason]),
-                            {error, Reason};
-                        #state{} = State_1 ->
-                            State_2 = State_1#state{chunk_size=tbd},
-                            parse_11_response(RemData, State_2)
-                    end
+            do_trace("Recvd another chunk...~p~n", [RemChunk]),
+            do_trace("RemData -> ~p~n", [RemData]),
+            case accumulate_response(RemChunk, State) of
+                {error, Reason} ->
+                    do_trace("Error accumulating response --> ~p~n", [Reason]),
+                    {error, Reason};
+                #state{} = State_1 ->
+                    State_2 = State_1#state{chunk_size=tbd},
+                    parse_11_response(RemData, State_2)
             end;
         false ->
             accumulate_response(DataRecvd,
@@ -1537,8 +1312,7 @@ handle_response(#request{from=From, stream_to=StreamTo, req_id=ReqId,
                          tmp_file_name = TmpFilename,
                          tmp_file_fd = Fd,
                          options       = Options,
-                         timer_ref     = ReqTimer,
-                         raw_req       = Raw_req
+                         timer_ref     = ReqTimer
                         },
                 #state{http_status_code = SCode,
                        status_line   = Status_line,
@@ -1558,26 +1332,19 @@ handle_response(#request{from=From, stream_to=StreamTo, req_id=ReqId,
                        _ ->
                            {file, TmpFilename}
                    end,
-    {Resp_headers_1, Raw_headers_1} = maybe_add_custom_headers(Status_line, RespHeaders, Raw_headers, Options),
-    Give_raw_req = get_value(return_raw_request, Options, false),
+    {Resp_headers_1, Raw_headers_1} = maybe_add_custom_headers(RespHeaders, Raw_headers, Options),
     Reply = case get_value(give_raw_headers, Options, false) of
-                true when Give_raw_req == false ->
-                    {ok, Status_line, Raw_headers_1, ResponseBody};
                 true ->
-                    {ok, Status_line, Raw_headers_1, ResponseBody, Raw_req};
-                false when Give_raw_req == false ->
-                    {ok, SCode, Resp_headers_1, ResponseBody};
+                    {ok, Status_line, Raw_headers_1, ResponseBody};
                 false ->
-                    {ok, SCode, Resp_headers_1, ResponseBody, Raw_req}
+                    {ok, SCode, Resp_headers_1, ResponseBody}
             end,
     State_1 = do_reply(State, From, StreamTo, ReqId, Resp_format, Reply),
     cancel_timer(ReqTimer, {eat_message, {req_timedout, From}}),
     set_cur_request(State_1);
 handle_response(#request{from=From, stream_to=StreamTo, req_id=ReqId,
                          response_format = Resp_format,
-                         options = Options, timer_ref = ReqTimer,
-                         raw_req  = Raw_req
-                        },
+                         options = Options, timer_ref = ReqTimer},
                 #state{http_status_code = SCode,
                        status_line      = Status_line,
                        raw_headers      = Raw_headers,
@@ -1585,17 +1352,12 @@ handle_response(#request{from=From, stream_to=StreamTo, req_id=ReqId,
                        reply_buffer     = RepBuf
                       } = State) ->
     Body = RepBuf,
-    {Resp_headers_1, Raw_headers_1} = maybe_add_custom_headers(Status_line, Resp_headers, Raw_headers, Options),
-    Give_raw_req = get_value(return_raw_request, Options, false),
+    {Resp_headers_1, Raw_headers_1} = maybe_add_custom_headers(Resp_headers, Raw_headers, Options),
     Reply = case get_value(give_raw_headers, Options, false) of
-                true when Give_raw_req == false ->
-                    {ok, Status_line, Raw_headers_1, Body};
                 true ->
-                    {ok, Status_line, Raw_headers_1, Body, Raw_req};
-                false when Give_raw_req == false ->
-                    {ok, SCode, Resp_headers_1, Body};
+                    {ok, Status_line, Raw_headers_1, Body};
                 false ->
-                    {ok, SCode, Resp_headers_1, Body, Raw_req}
+                    {ok, SCode, Resp_headers_1, Body}
             end,
     State_1 = do_reply(State, From, StreamTo, ReqId, Resp_format, Reply),
     cancel_timer(ReqTimer, {eat_message, {req_timedout, From}}),
@@ -1622,8 +1384,12 @@ set_cur_request(#state{reqs = Reqs, socket = Socket} = State) ->
         empty ->
             State#state{cur_req = undefined};
         {value, #request{caller_controls_socket = Ccs} = NextReq} ->
-            _ = Ccs =:= true
-		andalso do_setopts(Socket, [{active, once}], State),
+            case Ccs of
+                true ->
+                    do_setopts(Socket, [{active, once}], State);
+                _ ->
+                    ok
+            end,
             State#state{cur_req = NextReq}
     end.
 
@@ -1717,7 +1483,7 @@ parse_header(L) ->
     parse_header(L, []).
 
 parse_header([$: | V], Acc) ->
-    {lists:reverse(Acc), string:strip(V)};
+    {iolist_to_binary(lists:reverse(Acc)), iolist_to_binary(string:strip(V))};
 parse_header([H | T], Acc) ->
     parse_header(T, [H | Acc]);
 parse_header([], _) ->
@@ -1797,7 +1563,6 @@ get_crlf_pos(<<>>, _)                     -> no.
 fmt_val(L) when is_list(L)    -> L;
 fmt_val(I) when is_integer(I) -> integer_to_list(I);
 fmt_val(A) when is_atom(A)    -> atom_to_list(A);
-fmt_val(B) when is_binary(B)    -> B;
 fmt_val(Term)                 -> io_lib:format("~p", [Term]).
 
 crnl() -> "\r\n".
@@ -1890,7 +1655,7 @@ send_async_headers(ReqId, StreamTo, Give_raw_headers,
                           recvd_headers = Headers, http_status_code = StatCode,
                           cur_req = #request{options = Opts}
                          }) ->
-    {Headers_1, Raw_headers_1} = maybe_add_custom_headers(Status_line, Headers, Raw_headers, Opts),
+    {Headers_1, Raw_headers_1} = maybe_add_custom_headers(Headers, Raw_headers, Opts),
     case Give_raw_headers of
         false ->
             catch StreamTo ! {ibrowse_async_headers, ReqId, StatCode, Headers_1};
@@ -1898,7 +1663,7 @@ send_async_headers(ReqId, StreamTo, Give_raw_headers,
             catch StreamTo ! {ibrowse_async_headers, ReqId, Status_line, Raw_headers_1}
     end.
 
-maybe_add_custom_headers(Status_line, Headers, Raw_headers, Opts) ->
+maybe_add_custom_headers(Headers, Raw_headers, Opts) ->
     Custom_headers = get_value(add_custom_headers, Opts, []),
     Headers_1 = Headers ++ Custom_headers,
     Raw_headers_1 = case Custom_headers of
@@ -1908,12 +1673,7 @@ maybe_add_custom_headers(Status_line, Headers, Raw_headers, Opts) ->
                         _ ->
                             Raw_headers
                     end,
-    case get_value(preserve_status_line, Opts, false) of
-        true ->
-            {[{ibrowse_status_line, Status_line} | Headers_1], Raw_headers_1};
-        false ->
-            {Headers_1, Raw_headers_1}
-    end.
+    {Headers_1, Raw_headers_1}.
 
 format_response_data(Resp_format, Body) ->
     case Resp_format of
@@ -1928,11 +1688,6 @@ format_response_data(Resp_format, Body) ->
             %% {chunk_start, _}, chunk_end etc
             Body
     end.
-
-%% dont message an unexisting server
-%% triggered by :stop or :tcp_closed on an unactive connection
-do_reply(State, undefined, undefined, _, _, _Msg) ->
-    dec_pipeline_counter(State);
 
 do_reply(State, From, undefined, _, Resp_format, {ok, St_code, Headers, Body}) ->
     Msg_1 = {ok, St_code, Headers, format_response_data(Resp_format, Body)},
@@ -2050,15 +1805,8 @@ cancel_timer(Ref, {eat_message, Msg}) ->
     end.
 
 make_req_id() ->
-    case catch erlang:unique_integer() of
-        {'EXIT', _} ->
-            erlang:apply(erlang, now, []);
-        V ->
-            V
-    end.
+    now().
 
-to_lower(Str) when is_binary(Str) ->
-    to_lower(binary_to_list(Str));
 to_lower(Str) ->
     to_lower(Str, []).
 to_lower([H|T], Acc) when H >= $A, H =< $Z ->
@@ -2068,33 +1816,26 @@ to_lower([H|T], Acc) ->
 to_lower([], Acc) ->
     lists:reverse(Acc).
 
-shutting_down(#state{lb_ets_tid = undefined}) ->
-    ok;
-shutting_down(#state{lb_ets_tid = Tid,
-                     cur_pipeline_size = _Sz}) ->
-    (catch ets:select_delete(Tid, [{{{'_', '_', '$1'},'_'},[{'==','$1',{const,self()}}],[true]}])).
+shutting_down(_State) ->
+    ok.
 
 inc_pipeline_counter(#state{is_closing = true} = State) ->
     State;
-inc_pipeline_counter(#state{lb_ets_tid = undefined} = State) ->
+inc_pipeline_counter(#state{parent_lb = undefined} = State) ->
     State;
-inc_pipeline_counter(#state{cur_pipeline_size = Pipe_sz} = State) ->
+inc_pipeline_counter(#state{cur_pipeline_size = Pipe_sz,
+                            parent_lb = Pid} = State) ->
+    ibrowse_lb:increment_current(Pid, self()),
     State#state{cur_pipeline_size = Pipe_sz + 1}.
 
+dec_pipeline_counter(#state{is_closing = true} = State) ->
+    State;
+dec_pipeline_counter(#state{parent_lb = undefined} = State) ->
+    State;
 dec_pipeline_counter(#state{cur_pipeline_size = Pipe_sz,
-                            lb_ets_tid        = Tid,
-                            proc_state        = Proc_state} = State) when Tid /= undefined,
-                                                                          Proc_state /= ?dead_proc_walking ->
-    Ts = os:timestamp(),
-    catch ets:insert(Tid, {{Pipe_sz - 1, os:timestamp(), self()}, []}),
-    (catch ets:select_delete(Tid, [{{{'_', '$2', '$1'},'_'},
-                                    [{'==', '$1', {const,self()}},
-                                     {'<',  '$2', {const,Ts}}
-                                    ],
-                                    [true]}])),
-    State#state{cur_pipeline_size = Pipe_sz - 1};
-dec_pipeline_counter(State) ->
-    State.
+                            parent_lb=Pid} = State) ->
+    ibrowse_lb:decrement_current_pipeline(Pid, self()),
+    State#state{cur_pipeline_size = Pipe_sz - 1}.
 
 flatten([H | _] = L) when is_integer(H) ->
     L;
@@ -2104,16 +1845,11 @@ flatten([]) ->
     [].
 
 get_stream_chunk_size(Options) ->
-    case get_value(stream_full_chunks, Options, false) of
-        true ->
-            infinity;
+    case lists:keysearch(stream_chunk_size, 1, Options) of
+        {value, {_, V}} when V > 0 ->
+            V;
         _ ->
-            case lists:keysearch(stream_chunk_size, 1, Options) of
-                {value, {_, V}} when V > 0 ->
-                    V;
-                _ ->
-                    ?DEFAULT_STREAM_CHUNK_SIZE
-            end
+            ?DEFAULT_STREAM_CHUNK_SIZE
     end.
 
 set_inac_timer(State) ->
@@ -2170,20 +1906,5 @@ trace_request_body(Body) ->
             ok
     end.
 
-to_binary({X, _}) when is_function(X) -> to_binary(X);
-to_binary(X) when is_function(X)      -> <<"body generated by function">>;
-to_binary(X) when is_list(X)          -> list_to_binary(X);
-to_binary(X) when is_binary(X)        -> X.
-
-get_header_value(Name, Headers, Default_val) ->
-    case lists:keysearch(Name, 1, Headers) of
-        false ->
-            Default_val;
-        {value, {_, Val}} when is_binary(Val) ->
-            binary_to_list(Val);
-        {value, {_, Val}} ->
-            Val
-    end.
-
-delayed_stop_timer() ->
-    erlang:send_after(500, self(), delayed_stop).
+to_binary(X) when is_list(X)   -> list_to_binary(X);
+to_binary(X) when is_binary(X) -> X.
