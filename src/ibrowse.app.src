@@ -3,7 +3,7 @@
          {vsn, "4.4.2"},
          {registered, [ibrowse_sup, ibrowse]},
          {applications, [kernel,stdlib]},
-	 {env, []},
+	 {env, [ {inactivity_timeout, 30000} ]},
 	 {mod, {ibrowse_app, []}},
          {maintainers, ["Chandrashekhar Mullaparthi"]},
          {licenses, ["GPLv2", "BSD"]},
